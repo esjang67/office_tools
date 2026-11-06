@@ -6,19 +6,25 @@ SMB 공유 폴더 파일 복사 프로그램
 - DEVICE_TYPES / SHARE_NAME: 장비 종류에 따른 경로 구성
 - SUB_JOBS: 복사할 하위 항목 목록 (전체 복사 / 날짜 범위 필터 복사)
 - MODLOG_HEADERS: MODLOG 폴더 안에서 선택적으로 가져올 파일 종류
+
+접속은 Windows의 net use 대신 pysmb 라이브러리로 직접 한다.
+그래서 Win11에서 SMB1 클라이언트를 켜지 않아도 XP(SMB1) 장비에 접속할 수 있다.
+빌드 환경(Python 3.4): pip install -r requirements.txt
 """
 
 import calendar
 import os
 import re
-import shutil
-import subprocess
+import socket
 import sys
 import threading
 import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime, timedelta
+
+from smb.SMBConnection import SMBConnection
+from smb.smb_structs import OperationFailure
 
 # =========================================================
 # CONFIG - 실제 환경에 맞게 아래 값을 수정하세요
@@ -29,6 +35,13 @@ DEFAULT_USERNAME = "administrator"
 
 # 공유 폴더 이름: 실제 경로는 \\<주소>\<SHARE_NAME>\<장비폴더>\... 형태
 SHARE_NAME = "D"
+
+# 이 PC를 SMB 상대에게 알릴 이름 (NetBIOS 이름, 15자 이하 영문)
+CLIENT_NAME = "SMBCOPIER"
+
+# 접속 대기 시간(초) / 파일 전송 중 응답 대기 시간(초)
+CONNECT_TIMEOUT = 10
+FILE_TIMEOUT = 60
 
 # 장비 종류: 프로그램에 따라 \\<주소>\D\ 아래 폴더명이 다름
 DEVICE_TYPES = [
@@ -92,110 +105,132 @@ def get_app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def build_source(address: str, device_folder: str, subpath: str) -> str:
-    return "\\\\{0}\\{1}\\{2}\\{3}".format(address, SHARE_NAME, device_folder, subpath)
+def remote_join(*parts) -> str:
+    """공유 폴더 안의 경로를 SMB 형식(역슬래시)으로 연결"""
+    return "\\".join(p.strip("\\/") for p in parts if p and p.strip("\\/"))
 
 
-def get_unc_root(path: str) -> str:
-    """\\\\server\\share\\sub\\folder -> \\\\server\\share"""
-    parts = path.lstrip("\\").split("\\")
-    if len(parts) < 2:
-        return path
-    return "\\\\" + parts[0] + "\\" + parts[1]
+def unc_display(address: str, remote_path: str) -> str:
+    """로그 표시용 UNC 경로 (\\\\주소\\공유\\경로)"""
+    return "\\\\{0}\\{1}\\{2}".format(address, SHARE_NAME, remote_path)
 
 
-class _CompletedProcess(object):
-    """subprocess.run()은 Python 3.5+에만 있어서, 3.4에서도 쓸 수 있도록 흉내낸 것"""
-    def __init__(self, returncode, stdout, stderr):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+def open_smb(address: str, username: str, password: str, log):
+    """pysmb로 장비에 직접 SMB 접속.
+    Windows의 net use / SMB1 클라이언트 기능을 쓰지 않으므로
+    Win11에서 SMB1을 켜지 않아도 XP(SMB1) 장비에 접속할 수 있다.
+    SMB1/SMB2는 상대 장비에 맞춰 자동으로 선택된다."""
+    domain = ""
+    if "\\" in username:
+        domain, username = username.split("\\", 1)
 
+    errors = []
+    # 445(직접 TCP) 먼저, 안 되면 139(NetBIOS) 시도
+    for port, direct_tcp in ((445, True), (139, False)):
+        # NTLMv2 인증이 거부되면 NTLMv1로 재시도 (오래된 XP 설정 대비)
+        for use_ntlm_v2 in (True, False):
+            conn = SMBConnection(
+                username, password, CLIENT_NAME, "*SMBSERVER",
+                domain=domain, use_ntlm_v2=use_ntlm_v2, is_direct_tcp=direct_tcp,
+            )
+            try:
+                ok = conn.connect(address, port, sock_family=socket.AF_INET, timeout=CONNECT_TIMEOUT)
+            except (socket.error, OSError) as e:
+                conn.close()
+                errors.append("{0}번 포트 접속 불가: {1}".format(port, e))
+                break  # 이 포트는 안 열려 있음 -> 다음 포트
+            except Exception as e:
+                conn.close()
+                errors.append("{0}번 포트 통신 오류: {1!r}".format(port, e))
+                break
+            if ok:
+                log("[연결] \\\\{0} 접속 성공 (포트 {1}, {2}, {3})".format(
+                    address, port,
+                    "SMB2" if conn.isUsingSMB2 else "SMB1",
+                    "NTLMv2" if use_ntlm_v2 else "NTLMv1",
+                ))
+                return conn
+            conn.close()
+            errors.append("{0}번 포트 {1} 인증 실패".format(port, "NTLMv2" if use_ntlm_v2 else "NTLMv1"))
 
-def run_cmd(args):
-    # console=False(창 모드)로 빌드된 exe에는 표준입력(stdin) 핸들이 없어서,
-    # stdin을 지정하지 않으면 XP에서 "[WinError 6] 핸들이 잘못되었습니다"가 발생한다.
-    # 또 일부 XP(Embedded 등)에는 NUL 장치가 없어 subprocess.DEVNULL('nul')도 열 수 없으므로
-    # stdin도 파이프로 만든다. (communicate()가 입력 없이 바로 닫아줌)
-    kwargs = {}
-    if os.name == "nt":
-        # net.exe 실행 시 콘솔 창이 깜빡이지 않도록 숨김 (CREATE_NO_WINDOW)
-        kwargs["creationflags"] = 0x08000000
-    proc = subprocess.Popen(
-        args,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-        **kwargs
+    raise RuntimeError(
+        "\\\\{0} 접속 실패 (주소/사용자명/비밀번호를 확인하세요)\n- {1}".format(address, "\n- ".join(errors))
     )
-    out, err = proc.communicate()
-    return _CompletedProcess(proc.returncode, out, err)
 
 
-def connect_share(unc_root: str, username: str, password: str, log):
-    # 기존 연결이 있으면 먼저 끊기 (다른 계정으로 이미 연결된 경우 충돌 방지)
-    run_cmd(["net", "use", unc_root, "/delete", "/y"])
-    result = run_cmd(["net", "use", unc_root, password, "/user:{0}".format(username)])
-    if result.returncode != 0:
-        raise RuntimeError("{0} 접속 실패: {1}".format(unc_root, result.stderr.strip() or result.stdout.strip()))
-    log("[연결] {0} 접속 성공".format(unc_root))
-
-
-def disconnect_share(unc_root: str, log):
-    run_cmd(["net", "use", unc_root, "/delete", "/y"])
-    log("[연결 해제] {0}".format(unc_root))
-
-
-def copy_file(src_file: str, dst_file: str, log):
-    """파일 내용 + 메타데이터(수정시간 등) 복사.
-    Windows XP(SMB1) 공유에서는 메타데이터 조회/설정 단계에서
-    [WinError 6] 등이 날 수 있으므로, 실패하면 내용만 복사하고 계속 진행한다."""
+def close_smb(conn, address: str, log):
     try:
-        shutil.copy2(src_file, dst_file)
-    except OSError as e:
-        log("  [경고] copy2 실패({0}) -> 내용만 복사 재시도: {1}".format(e, src_file))
-        with open(src_file, "rb") as fsrc, open(dst_file, "wb") as fdst:
-            shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
+        conn.close()
+    except Exception:
+        pass
+    log("[연결 해제] \\\\{0}".format(address))
 
 
-def copy_all(source: str, dest: str, log):
-    if not os.path.isdir(source):
-        raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(source))
-    os.makedirs(dest, exist_ok=True)
+def remote_isdir(conn, remote_path: str) -> bool:
+    try:
+        return conn.getAttributes(SHARE_NAME, remote_path).isDirectory
+    except OperationFailure:
+        return False
+
+
+def list_remote(conn, remote_path: str):
+    """폴더 안의 항목 목록 ('.', '..' 제외)"""
+    return [f for f in conn.listPath(SHARE_NAME, remote_path) if f.filename not in (".", "..")]
+
+
+def download_file(conn, remote_file: str, shared_file, dst_file: str):
+    """원격 파일을 로컬로 내려받고 수정 시간을 원본과 맞춘다."""
+    try:
+        with open(dst_file, "wb") as fobj:
+            conn.retrieveFile(SHARE_NAME, remote_file, fobj, timeout=FILE_TIMEOUT)
+    except Exception:
+        # 중간에 실패하면 불완전한 파일이 남지 않도록 삭제
+        try:
+            os.remove(dst_file)
+        except OSError:
+            pass
+        raise
+    try:
+        os.utime(dst_file, (shared_file.last_access_time, shared_file.last_write_time))
+    except (OSError, ValueError, OverflowError):
+        pass  # 시간 정보만 못 맞춘 것이므로 무시
+
+
+def copy_all(conn, address: str, source: str, dest: str, log):
+    if not remote_isdir(conn, source):
+        raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(unc_display(address, source)))
     count = 0
-    def _walk_error(err):
-        # os.walk는 기본적으로 폴더 목록 조회 오류를 조용히 무시하므로 그대로 올린다
-        raise err
-
-    for root, dirs, files in os.walk(source, onerror=_walk_error):
-        rel = os.path.relpath(root, source)
-        target_dir = os.path.join(dest, rel) if rel != "." else dest
-        os.makedirs(target_dir, exist_ok=True)
-        for fname in files:
-            src_file = os.path.join(root, fname)
-            dst_file = os.path.join(target_dir, fname)
-            copy_file(src_file, dst_file, log)
+    # 하위 폴더까지 순회 (스택 사용)
+    stack = [(source, dest)]
+    while stack:
+        remote_dir, local_dir = stack.pop()
+        os.makedirs(local_dir, exist_ok=True)
+        for f in list_remote(conn, remote_dir):
+            remote_file = remote_join(remote_dir, f.filename)
+            local_file = os.path.join(local_dir, f.filename)
+            if f.isDirectory:
+                stack.append((remote_file, local_file))
+                continue
+            download_file(conn, remote_file, f, local_file)
             count += 1
-            log("  복사: {0} -> {1}".format(src_file, dst_file))
-    log("[완료] {0} : {1}개 파일 복사".format(source, count))
+            log("  복사: {0} -> {1}".format(unc_display(address, remote_file), local_file))
+    log("[완료] {0} : {1}개 파일 복사".format(unc_display(address, source), count))
 
 
-def copy_date_range(source: str, dest: str, date_regex: str, date_format: str,
-                     start_date: datetime, end_date: datetime, log):
-    if not os.path.isdir(source):
-        raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(source))
+def copy_date_range(conn, address: str, source: str, dest: str, date_regex: str, date_format: str,
+                    start_date: datetime, end_date: datetime, log):
+    if not remote_isdir(conn, source):
+        raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(unc_display(address, source)))
     os.makedirs(dest, exist_ok=True)
     pattern = re.compile(date_regex, re.IGNORECASE)
     # 종료일은 사용자가 날짜만 입력하므로, 그 날의 마지막 순간까지 포함시킴
     end_date_inclusive = end_date + timedelta(days=1) - timedelta(seconds=1)
     count = 0
     skipped = 0
-    for fname in os.listdir(source):
-        src_file = os.path.join(source, fname)
-        if not os.path.isfile(src_file):
+    for f in list_remote(conn, source):
+        if f.isDirectory:
             continue
-        m = pattern.search(fname)
+        m = pattern.search(f.filename)
         if not m:
             skipped += 1
             continue
@@ -205,11 +240,15 @@ def copy_date_range(source: str, dest: str, date_regex: str, date_format: str,
             skipped += 1
             continue
         if start_date <= file_date <= end_date_inclusive:
-            dst_file = os.path.join(dest, fname)
-            copy_file(src_file, dst_file, log)
+            remote_file = remote_join(source, f.filename)
+            dst_file = os.path.join(dest, f.filename)
+            download_file(conn, remote_file, f, dst_file)
             count += 1
-            log("  복사: {0} -> {1}".format(src_file, dst_file))
-    log("[완료] {0} : {1}개 파일 복사 (범위 밖/미매칭 {2}개 제외)".format(source, count, skipped))
+            log("  복사: {0} -> {1}".format(unc_display(address, remote_file), dst_file))
+        else:
+            skipped += 1
+    log("[완료] {0} : {1}개 파일 복사 (범위 밖/미매칭 {2}개 제외)".format(
+        unc_display(address, source), count, skipped))
 
 
 # =========================================================
@@ -483,27 +522,25 @@ class App(tk.Tk):
         thread.start()
 
     def _test_connection(self, address, username, password, device_folder):
-        unc_root = "\\\\{0}\\{1}".format(address, SHARE_NAME)
-        connected = False
+        conn = None
         try:
-            connect_share(unc_root, username, password, self.log)
-            connected = True
-            base_path = "{0}\\{1}".format(unc_root, device_folder)
-            if os.path.isdir(base_path):
-                self.log("[확인] {0} 접근 가능".format(base_path))
+            conn = open_smb(address, username, password, self.log)
+            if remote_isdir(conn, device_folder):
+                self.log("[확인] {0} 접근 가능".format(unc_display(address, device_folder)))
                 self.after(0, lambda: messagebox.showinfo("연결 확인", "연결 성공: 해당 경로에 접근할 수 있습니다."))
             else:
-                self.log("[확인] {0} 경로를 찾을 수 없습니다".format(base_path))
+                self.log("[확인] {0} 경로를 찾을 수 없습니다".format(unc_display(address, device_folder)))
                 self.after(0, lambda: messagebox.showwarning(
                     "연결 확인", "공유 폴더 접속은 됐지만, 해당 장비 폴더를 찾을 수 없습니다.\n장비 종류나 주소를 다시 확인하세요."
                 ))
         except Exception as e:
-            self.log("[확인 실패] {0}".format(e))
+            msg = str(e)
+            self.log("[확인 실패] {0}".format(msg))
             self.log(traceback.format_exc())
-            self.after(0, lambda: messagebox.showerror("연결 확인", str(e)))
+            self.after(0, lambda: messagebox.showerror("연결 확인", msg))
         finally:
-            if connected:
-                disconnect_share(unc_root, self.log)
+            if conn is not None:
+                close_smb(conn, address, self.log)
             self.after(0, lambda: self._set_busy(False))
 
     # ---- 복사 실행 ----
@@ -564,24 +601,19 @@ class App(tk.Tk):
         thread.start()
 
     def _run_jobs(self, jobs, address, username, password, device_folder, dest_root, start_date, end_date):
-        connected_roots = set()
+        conn = None
         try:
-            sources = {job["name"]: build_source(address, device_folder, job["subpath"]) for job in jobs}
-
-            unc_roots = {get_unc_root(src) for src in sources.values()}
-            for unc_root in unc_roots:
-                connect_share(unc_root, username, password, self.log)
-                connected_roots.add(unc_root)
+            conn = open_smb(address, username, password, self.log)
 
             for job in jobs:
                 self.log("\n=== {0} 시작 ===".format(job["name"]))
-                source = sources[job["name"]]
+                source = remote_join(device_folder, job["subpath"])
                 dest = os.path.join(dest_root, job["name"])
                 if job["mode"] == "all":
-                    copy_all(source, dest, self.log)
+                    copy_all(conn, address, source, dest, self.log)
                 elif job["mode"] == "date_range":
                     copy_date_range(
-                        source, dest,
+                        conn, address, source, dest,
                         job["date_regex"], job["date_format"],
                         start_date, end_date, self.log,
                     )
@@ -589,12 +621,13 @@ class App(tk.Tk):
             self.log("\n모든 작업이 완료되었습니다.")
             self.after(0, lambda: messagebox.showinfo("완료", "파일 복사가 완료되었습니다."))
         except Exception as e:
-            self.log("\n[오류] {0}".format(e))
+            msg = str(e)
+            self.log("\n[오류] {0}".format(msg))
             self.log(traceback.format_exc())
-            self.after(0, lambda: messagebox.showerror("오류", str(e)))
+            self.after(0, lambda: messagebox.showerror("오류", msg))
         finally:
-            for unc_root in connected_roots:
-                disconnect_share(unc_root, self.log)
+            if conn is not None:
+                close_smb(conn, address, self.log)
             self.after(0, lambda: self._set_busy(False))
 
 
