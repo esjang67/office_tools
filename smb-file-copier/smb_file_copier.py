@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime, timedelta
@@ -146,19 +147,35 @@ def disconnect_share(unc_root: str, log):
     log("[연결 해제] {0}".format(unc_root))
 
 
+def copy_file(src_file: str, dst_file: str, log):
+    """파일 내용 + 메타데이터(수정시간 등) 복사.
+    Windows XP(SMB1) 공유에서는 메타데이터 조회/설정 단계에서
+    [WinError 6] 등이 날 수 있으므로, 실패하면 내용만 복사하고 계속 진행한다."""
+    try:
+        shutil.copy2(src_file, dst_file)
+    except OSError as e:
+        log("  [경고] copy2 실패({0}) -> 내용만 복사 재시도: {1}".format(e, src_file))
+        with open(src_file, "rb") as fsrc, open(dst_file, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
+
+
 def copy_all(source: str, dest: str, log):
     if not os.path.isdir(source):
         raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(source))
     os.makedirs(dest, exist_ok=True)
     count = 0
-    for root, dirs, files in os.walk(source):
+    def _walk_error(err):
+        # os.walk는 기본적으로 폴더 목록 조회 오류를 조용히 무시하므로 그대로 올린다
+        raise err
+
+    for root, dirs, files in os.walk(source, onerror=_walk_error):
         rel = os.path.relpath(root, source)
         target_dir = os.path.join(dest, rel) if rel != "." else dest
         os.makedirs(target_dir, exist_ok=True)
         for fname in files:
             src_file = os.path.join(root, fname)
             dst_file = os.path.join(target_dir, fname)
-            shutil.copy2(src_file, dst_file)
+            copy_file(src_file, dst_file, log)
             count += 1
             log("  복사: {0} -> {1}".format(src_file, dst_file))
     log("[완료] {0} : {1}개 파일 복사".format(source, count))
@@ -189,7 +206,7 @@ def copy_date_range(source: str, dest: str, date_regex: str, date_format: str,
             continue
         if start_date <= file_date <= end_date_inclusive:
             dst_file = os.path.join(dest, fname)
-            shutil.copy2(src_file, dst_file)
+            copy_file(src_file, dst_file, log)
             count += 1
             log("  복사: {0} -> {1}".format(src_file, dst_file))
     log("[완료] {0} : {1}개 파일 복사 (범위 밖/미매칭 {2}개 제외)".format(source, count, skipped))
@@ -482,6 +499,7 @@ class App(tk.Tk):
                 ))
         except Exception as e:
             self.log("[확인 실패] {0}".format(e))
+            self.log(traceback.format_exc())
             self.after(0, lambda: messagebox.showerror("연결 확인", str(e)))
         finally:
             if connected:
@@ -572,6 +590,7 @@ class App(tk.Tk):
             self.after(0, lambda: messagebox.showinfo("완료", "파일 복사가 완료되었습니다."))
         except Exception as e:
             self.log("\n[오류] {0}".format(e))
+            self.log(traceback.format_exc())
             self.after(0, lambda: messagebox.showerror("오류", str(e)))
         finally:
             for unc_root in connected_roots:
