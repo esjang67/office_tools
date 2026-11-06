@@ -112,8 +112,21 @@ class _CompletedProcess(object):
 
 
 def run_cmd(args):
+    # console=False(창 모드)로 빌드된 exe에는 표준입력(stdin) 핸들이 없다.
+    # stdin을 지정하지 않으면 Popen이 부모의 stdin 핸들을 복제(DuplicateHandle)하려다
+    # Windows XP + Python 3.4 환경에서 "[WinError 6] 핸들이 잘못되었습니다"가 발생하므로
+    # stdin/stdout/stderr를 모두 명시적으로 지정한다.
+    kwargs = {}
+    if os.name == "nt":
+        # net.exe 실행 시 콘솔 창이 깜빡이지 않도록 숨김 (CREATE_NO_WINDOW)
+        kwargs["creationflags"] = 0x08000000
     proc = subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        **kwargs
     )
     out, err = proc.communicate()
     return _CompletedProcess(proc.returncode, out, err)
