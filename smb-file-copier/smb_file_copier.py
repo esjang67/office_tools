@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 
 from smb.SMBConnection import SMBConnection
 from smb.smb_structs import OperationFailure
+from nmb.NetBIOS import NetBIOS
 
 # =========================================================
 # CONFIG - 실제 환경에 맞게 아래 값을 수정하세요
@@ -115,43 +116,119 @@ def unc_display(address: str, remote_path: str) -> str:
     return "\\\\{0}\\{1}\\{2}".format(address, SHARE_NAME, remote_path)
 
 
+# 로그인 실패 시 장비가 돌려주는 NT 상태 코드 -> 안내 문구
+NT_STATUS_TEXT = {
+    0xC000006D: "로그온 실패 (사용자명/비밀번호 불일치)",
+    0xC0000064: "존재하지 않는 사용자",
+    0xC000006A: "비밀번호 틀림",
+    0xC000006E: "계정 제한 (빈 비밀번호 계정은 네트워크 접속 불가 등)",
+    0xC0000072: "계정 사용 안 함(비활성)",
+    0xC0000234: "계정 잠김 (로그인 실패 횟수 초과)",
+    0xC0000193: "계정 만료",
+    0xC0000071: "비밀번호 만료",
+    0xC000015B: "네트워크 로그온 권한 없음",
+    0xC000006F: "로그온 허용 시간 아님",
+    0xC0000070: "허용되지 않은 PC",
+    0xC0000022: "접근 거부",
+}
+
+# 더 시도해 봐야 소용없는 상태 (계정 자체 문제)
+NT_STATUS_STOP = (0xC0000072, 0xC0000234, 0xC0000193, 0xC0000071, 0xC000015B)
+
+
+def nt_status_text(status) -> str:
+    if status is None:
+        return "응답 코드 없음"
+    return "{0} [0x{1:08X}]".format(NT_STATUS_TEXT.get(status, "알 수 없는 오류"), status)
+
+
+class _SMBConnection(SMBConnection):
+    """로그인(Session Setup) 응답의 NT 상태 코드를 기록해 두는 SMBConnection"""
+    last_auth_status = None
+
+    def _updateState_SMB1(self, message):
+        if message.isReply and message.command == 0x73:  # SMB_COM_SESSION_SETUP_ANDX
+            self.last_auth_status = message.status.internal_value
+        return SMBConnection._updateState_SMB1(self, message)
+
+    def _updateState_SMB2(self, message):
+        if message.isReply and message.command == 0x01:  # SMB2_COM_SESSION_SETUP
+            self.last_auth_status = message.status
+        return SMBConnection._updateState_SMB2(self, message)
+
+
+def query_netbios_name(address: str):
+    """장비의 NetBIOS 컴퓨터 이름 조회 (UDP 137). 실패하면 None"""
+    try:
+        nb = NetBIOS(broadcast=False)
+        try:
+            names = nb.queryIPForName(address, timeout=3)
+        finally:
+            nb.close()
+        if names:
+            return names[0].strip()
+    except Exception:
+        pass
+    return None
+
+
 def open_smb(address: str, username: str, password: str, log):
     """pysmb로 장비에 직접 SMB 접속.
     Windows의 net use / SMB1 클라이언트 기능을 쓰지 않으므로
     Win11에서 SMB1을 켜지 않아도 XP(SMB1) 장비에 접속할 수 있다.
-    SMB1/SMB2는 상대 장비에 맞춰 자동으로 선택된다."""
-    domain = ""
+    SMB1/SMB2는 상대 장비에 맞춰 자동으로 선택된다.
+    사용자명에 '도메인\\사용자' 형태로 도메인(컴퓨터 이름)을 지정할 수 있다."""
     if "\\" in username:
         domain, username = username.split("\\", 1)
+        domains = [domain]
+    else:
+        # 로컬 계정은 도메인 = 장비의 컴퓨터 이름. 빈 값 -> 컴퓨터 이름 순으로 시도
+        domains = [""]
+        nb_name = query_netbios_name(address)
+        if nb_name:
+            log("[정보] 장비 컴퓨터 이름: {0}".format(nb_name))
+            domains.append(nb_name)
 
     errors = []
-    # 445(직접 TCP) 먼저, 안 되면 139(NetBIOS) 시도
+    # 445(직접 TCP) 먼저, 포트가 막혀 있을 때만 139(NetBIOS) 시도
     for port, direct_tcp in ((445, True), (139, False)):
-        # NTLMv2 인증이 거부되면 NTLMv1로 재시도 (오래된 XP 설정 대비)
-        for use_ntlm_v2 in (True, False):
-            conn = SMBConnection(
-                username, password, CLIENT_NAME, "*SMBSERVER",
-                domain=domain, use_ntlm_v2=use_ntlm_v2, is_direct_tcp=direct_tcp,
-            )
-            try:
-                ok = conn.connect(address, port, sock_family=socket.AF_INET, timeout=CONNECT_TIMEOUT)
-            except (socket.error, OSError) as e:
+        port_reachable = True
+        for domain in domains:
+            # NTLMv2 인증이 거부되면 NTLMv1로 재시도 (오래된 XP 설정 대비)
+            for use_ntlm_v2 in (True, False):
+                desc = "{0}번 포트 {1} 도메인='{2}'".format(port, "NTLMv2" if use_ntlm_v2 else "NTLMv1", domain)
+                conn = _SMBConnection(
+                    username, password, CLIENT_NAME, "*SMBSERVER",
+                    domain=domain, use_ntlm_v2=use_ntlm_v2, is_direct_tcp=direct_tcp,
+                )
+                try:
+                    ok = conn.connect(address, port, sock_family=socket.AF_INET, timeout=CONNECT_TIMEOUT)
+                except (socket.error, OSError) as e:
+                    conn.close()
+                    if conn.last_auth_status is None:
+                        errors.append("{0}번 포트 접속 불가: {1}".format(port, e))
+                        port_reachable = False
+                        break
+                    ok = False
+                except Exception as e:
+                    conn.close()
+                    if conn.last_auth_status is None:
+                        errors.append("{0} 통신 오류: {1!r}".format(desc, e))
+                        continue
+                    ok = False
+                if ok:
+                    log("[연결] \\\\{0} 접속 성공 ({1}, {2})".format(
+                        address, desc, "SMB2" if conn.isUsingSMB2 else "SMB1"))
+                    return conn
                 conn.close()
-                errors.append("{0}번 포트 접속 불가: {1}".format(port, e))
-                break  # 이 포트는 안 열려 있음 -> 다음 포트
-            except Exception as e:
-                conn.close()
-                errors.append("{0}번 포트 통신 오류: {1!r}".format(port, e))
+                errors.append("{0} 인증 실패: {1}".format(desc, nt_status_text(conn.last_auth_status)))
+                log("[시도] {0} -> {1}".format(desc, nt_status_text(conn.last_auth_status)))
+                if conn.last_auth_status in NT_STATUS_STOP:
+                    raise RuntimeError("\\\\{0} 접속 실패: {1}".format(address, nt_status_text(conn.last_auth_status)))
+            if not port_reachable:
                 break
-            if ok:
-                log("[연결] \\\\{0} 접속 성공 (포트 {1}, {2}, {3})".format(
-                    address, port,
-                    "SMB2" if conn.isUsingSMB2 else "SMB1",
-                    "NTLMv2" if use_ntlm_v2 else "NTLMv1",
-                ))
-                return conn
-            conn.close()
-            errors.append("{0}번 포트 {1} 인증 실패".format(port, "NTLMv2" if use_ntlm_v2 else "NTLMv1"))
+        if port_reachable:
+            break  # 445로 통신은 됐으므로(인증만 실패) 139는 시도할 필요 없음
 
     raise RuntimeError(
         "\\\\{0} 접속 실패 (주소/사용자명/비밀번호를 확인하세요)\n- {1}".format(address, "\n- ".join(errors))
