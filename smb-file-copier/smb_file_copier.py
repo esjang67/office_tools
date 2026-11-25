@@ -16,6 +16,7 @@ import calendar
 import os
 import re
 import socket
+import struct
 import sys
 import threading
 import traceback
@@ -25,7 +26,13 @@ from datetime import datetime, timedelta
 
 from smb.SMBConnection import SMBConnection
 from smb.smb_structs import OperationFailure
-from nmb.NetBIOS import NetBIOS
+from smb import ntlm, securityblob
+from smb.smb_constants import (
+    CAP_EXTENDED_SECURITY,
+    NEGOTIATE_SECURITY_SIGNATURES_ENABLE,
+    NEGOTIATE_SECURITY_SIGNATURES_REQUIRE,
+)
+from smb.smb_structs import SMBMessage, ComSessionSetupAndxRequest__WithSecurityExtension
 
 # =========================================================
 # CONFIG - 실제 환경에 맞게 아래 값을 수정하세요
@@ -142,9 +149,37 @@ def nt_status_text(status) -> str:
     return "{0} [0x{1:08X}]".format(NT_STATUS_TEXT.get(status, "알 수 없는 오류"), status)
 
 
+def decode_ntlm_target_name(ntlm_token) -> str:
+    """NTLM CHALLENGE 메시지에서 TargetName(로컬 계정이면 장비 컴퓨터 이름)을 꺼낸다."""
+    try:
+        data = bytes(ntlm_token)
+        tn_len, _, tn_offset, flags = struct.unpack("<HHII", data[12:24])
+        raw = data[tn_offset:tn_offset + tn_len]
+        if flags & ntlm.NTLM_NegotiateUnicode:
+            return raw.decode("utf-16-le")
+        return raw.decode("ascii", "replace")
+    except Exception:
+        return ""
+
+
 class _SMBConnection(SMBConnection):
-    """로그인(Session Setup) 응답의 NT 상태 코드를 기록해 두는 SMBConnection"""
+    """pysmb SMBConnection을 Windows 클라이언트(net use)와 같은 방식으로 인증하도록 보정.
+
+    1) 도메인을 비워 두면(auto_domain) 서버가 CHALLENGE에 담아 보낸 TargetName을
+       도메인으로 사용한다. Windows도 '/user:administrator'처럼 도메인 없이 접속하면
+       이렇게 한다. XP는 NTLMv2 계산에 이 도메인이 들어가야 로그인을 받아준다.
+    2) NTLMv1은 서버가 Extended Session Security를 허용했을 때만 NTLM2 세션 응답을 쓴다.
+       (pysmb 원본은 무조건 사용해서, 허용하지 않는 장비에서는 비밀번호가 맞아도 실패)
+    3) 로그인 응답의 NT 상태 코드를 last_auth_status에 기록한다.
+    """
     last_auth_status = None
+    auto_domain = False
+    used_domain = ""
+
+    def _apply_target_domain(self, ntlm_token):
+        if self.auto_domain:
+            self.domain = decode_ntlm_target_name(ntlm_token)
+        self.used_domain = self.domain
 
     def _updateState_SMB1(self, message):
         if message.isReply and message.command == 0x73:  # SMB_COM_SESSION_SETUP_ANDX
@@ -156,20 +191,44 @@ class _SMBConnection(SMBConnection):
             self.last_auth_status = message.status
         return SMBConnection._updateState_SMB2(self, message)
 
+    def _handleSessionChallenge_SMB2(self, message, ntlm_token):
+        self._apply_target_domain(ntlm_token)
+        return SMBConnection._handleSessionChallenge_SMB2(self, message, ntlm_token)
 
-def query_netbios_name(address: str):
-    """장비의 NetBIOS 컴퓨터 이름 조회 (UDP 137). 실패하면 None"""
-    try:
-        nb = NetBIOS(broadcast=False)
-        try:
-            names = nb.queryIPForName(address, timeout=3)
-        finally:
-            nb.close()
-        if names:
-            return names[0].strip()
-    except Exception:
-        pass
-    return None
+    def _handleSessionChallenge_SMB1(self, message, ntlm_token):
+        # pysmb 1.2.7 smb/base.py 의 같은 메서드를 옮겨 와서 위 1), 2)만 고친 것
+        self._apply_target_domain(ntlm_token)
+        if message.uid and not self.uid:
+            self.uid = message.uid
+
+        server_challenge, server_flags, server_info = ntlm.decodeChallengeMessage(ntlm_token)
+        if self.use_ntlm_v2:
+            nt_resp, lm_resp, session_key = ntlm.generateChallengeResponseV2(
+                self.password, self.username, server_challenge, server_info, self.domain)
+        else:
+            ess = bool(server_flags & ntlm.NTLM_NegotiateExtendedSecurity)
+            nt_resp, lm_resp, session_key = ntlm.generateChallengeResponseV1(
+                self.password, server_challenge, ess)
+
+        ntlm_data, signing_session_key = ntlm.generateAuthenticateMessage(
+            server_flags, nt_resp, lm_resp, session_key, self.username, self.domain, self.my_name)
+
+        blob = securityblob.generateAuthSecurityBlob(ntlm_data)
+        self._sendSMBMessage(SMBMessage(ComSessionSetupAndxRequest__WithSecurityExtension(0, blob)))
+
+        if self.security_mode & NEGOTIATE_SECURITY_SIGNATURES_REQUIRE:
+            self.is_signing_active = (self.sign_options != SMBConnection.SIGN_NEVER)
+        elif self.security_mode & NEGOTIATE_SECURITY_SIGNATURES_ENABLE:
+            self.is_signing_active = (self.sign_options == SMBConnection.SIGN_WHEN_SUPPORTED)
+        else:
+            self.is_signing_active = False
+
+        if self.is_signing_active:
+            self.signing_session_key = signing_session_key
+            if self.capabilities & CAP_EXTENDED_SECURITY:
+                self.signing_challenge_response = None
+            else:
+                self.signing_challenge_response = blob
 
 
 def open_smb(address: str, username: str, password: str, log):
@@ -177,56 +236,54 @@ def open_smb(address: str, username: str, password: str, log):
     Windows의 net use / SMB1 클라이언트 기능을 쓰지 않으므로
     Win11에서 SMB1을 켜지 않아도 XP(SMB1) 장비에 접속할 수 있다.
     SMB1/SMB2는 상대 장비에 맞춰 자동으로 선택된다.
-    사용자명에 '도메인\\사용자' 형태로 도메인(컴퓨터 이름)을 지정할 수 있다."""
+    사용자명에 '도메인\\사용자' 형태로 도메인을 직접 지정할 수도 있다."""
     if "\\" in username:
         domain, username = username.split("\\", 1)
-        domains = [domain]
+        # (NTLMv2 여부, 도메인 자동 여부, 도메인)
+        attempts = [(True, False, domain), (False, False, domain)]
     else:
-        # 로컬 계정은 도메인 = 장비의 컴퓨터 이름. 빈 값 -> 컴퓨터 이름 순으로 시도
-        domains = [""]
-        nb_name = query_netbios_name(address)
-        if nb_name:
-            log("[정보] 장비 컴퓨터 이름: {0}".format(nb_name))
-            domains.append(nb_name)
+        attempts = [
+            (True, True, ""),    # Windows 방식: 장비 컴퓨터 이름을 도메인으로
+            (True, False, ""),   # 도메인 빈 값
+            (False, True, ""),   # NTLMv1
+        ]
 
     errors = []
     # 445(직접 TCP) 먼저, 포트가 막혀 있을 때만 139(NetBIOS) 시도
     for port, direct_tcp in ((445, True), (139, False)):
         port_reachable = True
-        for domain in domains:
-            # NTLMv2 인증이 거부되면 NTLMv1로 재시도 (오래된 XP 설정 대비)
-            for use_ntlm_v2 in (True, False):
-                desc = "{0}번 포트 {1} 도메인='{2}'".format(port, "NTLMv2" if use_ntlm_v2 else "NTLMv1", domain)
-                conn = _SMBConnection(
-                    username, password, CLIENT_NAME, "*SMBSERVER",
-                    domain=domain, use_ntlm_v2=use_ntlm_v2, is_direct_tcp=direct_tcp,
-                )
-                try:
-                    ok = conn.connect(address, port, sock_family=socket.AF_INET, timeout=CONNECT_TIMEOUT)
-                except (socket.error, OSError) as e:
-                    conn.close()
-                    if conn.last_auth_status is None:
-                        errors.append("{0}번 포트 접속 불가: {1}".format(port, e))
-                        port_reachable = False
-                        break
-                    ok = False
-                except Exception as e:
-                    conn.close()
-                    if conn.last_auth_status is None:
-                        errors.append("{0} 통신 오류: {1!r}".format(desc, e))
-                        continue
-                    ok = False
-                if ok:
-                    log("[연결] \\\\{0} 접속 성공 ({1}, {2})".format(
-                        address, desc, "SMB2" if conn.isUsingSMB2 else "SMB1"))
-                    return conn
+        for use_ntlm_v2, auto_domain, domain in attempts:
+            conn = _SMBConnection(
+                username, password, CLIENT_NAME, "*SMBSERVER",
+                domain=domain, use_ntlm_v2=use_ntlm_v2, is_direct_tcp=direct_tcp,
+            )
+            conn.auto_domain = auto_domain
+            try:
+                ok = conn.connect(address, port, sock_family=socket.AF_INET, timeout=CONNECT_TIMEOUT)
+            except (socket.error, OSError) as e:
                 conn.close()
-                errors.append("{0} 인증 실패: {1}".format(desc, nt_status_text(conn.last_auth_status)))
-                log("[시도] {0} -> {1}".format(desc, nt_status_text(conn.last_auth_status)))
-                if conn.last_auth_status in NT_STATUS_STOP:
-                    raise RuntimeError("\\\\{0} 접속 실패: {1}".format(address, nt_status_text(conn.last_auth_status)))
-            if not port_reachable:
-                break
+                if conn.last_auth_status is None:
+                    errors.append("{0}번 포트 접속 불가: {1}".format(port, e))
+                    port_reachable = False
+                    break
+                ok = False
+            except Exception as e:
+                conn.close()
+                if conn.last_auth_status is None:
+                    errors.append("{0}번 포트 통신 오류: {1!r}".format(port, e))
+                    continue
+                ok = False
+            desc = "{0}번 포트 {1} 도메인='{2}'".format(
+                port, "NTLMv2" if use_ntlm_v2 else "NTLMv1", conn.used_domain)
+            if ok:
+                log("[연결] \\\\{0} 접속 성공 ({1}, {2})".format(
+                    address, desc, "SMB2" if conn.isUsingSMB2 else "SMB1"))
+                return conn
+            conn.close()
+            errors.append("{0} 인증 실패: {1}".format(desc, nt_status_text(conn.last_auth_status)))
+            log("[시도] {0} -> {1}".format(desc, nt_status_text(conn.last_auth_status)))
+            if conn.last_auth_status in NT_STATUS_STOP:
+                raise RuntimeError("\\\\{0} 접속 실패: {1}".format(address, nt_status_text(conn.last_auth_status)))
         if port_reachable:
             break  # 445로 통신은 됐으므로(인증만 실패) 139는 시도할 필요 없음
 
