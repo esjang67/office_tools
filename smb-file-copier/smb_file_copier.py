@@ -118,9 +118,9 @@ def remote_join(*parts) -> str:
     return "\\".join(p.strip("\\/") for p in parts if p and p.strip("\\/"))
 
 
-def unc_display(address: str, remote_path: str) -> str:
+def unc_display(address: str, remote_path: str, share: str = SHARE_NAME) -> str:
     """로그 표시용 UNC 경로 (\\\\주소\\공유\\경로)"""
-    return "\\\\{0}\\{1}\\{2}".format(address, SHARE_NAME, remote_path)
+    return "\\\\{0}\\{1}".format(address, remote_join(share, remote_path))
 
 
 # 로그인 실패 시 장비가 돌려주는 NT 상태 코드 -> 안내 문구
@@ -175,6 +175,7 @@ class _SMBConnection(SMBConnection):
     last_auth_status = None
     auto_domain = False
     used_domain = ""
+    share_name = SHARE_NAME  # 접속 후 장비의 실제 공유 이름(대소문자)으로 바뀜
 
     def _apply_target_domain(self, ntlm_token):
         if self.auto_domain:
@@ -278,6 +279,11 @@ def open_smb(address: str, username: str, password: str, log):
             if ok:
                 log("[연결] \\\\{0} 접속 성공 ({1}, {2})".format(
                     address, desc, "SMB2" if conn.isUsingSMB2 else "SMB1"))
+                try:
+                    conn.share_name = resolve_share(conn, address, log)
+                except Exception:
+                    conn.close()
+                    raise
                 return conn
             conn.close()
             errors.append("{0} 인증 실패: {1}".format(desc, nt_status_text(conn.last_auth_status)))
@@ -300,23 +306,76 @@ def close_smb(conn, address: str, log):
     log("[연결 해제] \\\\{0}".format(address))
 
 
-def remote_isdir(conn, remote_path: str) -> bool:
+class RemotePathNotFound(RuntimeError):
+    """장비에 접속은 됐지만 공유 이름이나 폴더를 찾지 못한 경우"""
+
+
+def _names_preview(names, limit=20) -> str:
+    names = sorted(names, key=lambda s: s.lower())
+    if not names:
+        return "(비어 있음)"
+    text = ", ".join(names[:limit])
+    if len(names) > limit:
+        text += " 외 {0}개".format(len(names) - limit)
+    return text
+
+
+def resolve_share(conn, address: str, log) -> str:
+    """장비의 공유 목록에서 SHARE_NAME을 대소문자 구분 없이 찾아 실제 이름을 돌려준다.
+    공유 목록 조회 자체가 안 되는 장비면 SHARE_NAME을 그대로 쓴다."""
     try:
-        return conn.getAttributes(SHARE_NAME, remote_path).isDirectory
-    except OperationFailure:
-        return False
+        shares = [s.name for s in conn.listShares(timeout=CONNECT_TIMEOUT)]
+    except Exception as e:
+        log("[참고] 공유 목록을 가져오지 못해 '{0}'을(를) 그대로 사용합니다: {1}".format(SHARE_NAME, e))
+        return SHARE_NAME
+    for name in shares:
+        if name.lower() == SHARE_NAME.lower():
+            if name != SHARE_NAME:
+                log("[참고] 공유 이름 '{0}' -> 장비의 실제 이름 '{1}' 사용".format(SHARE_NAME, name))
+            return name
+    raise RemotePathNotFound(
+        "\\\\{0} 에 '{1}' 공유가 없습니다.\n장비의 공유 목록: {2}".format(
+            address, SHARE_NAME, _names_preview(shares))
+    )
 
 
 def list_remote(conn, remote_path: str):
     """폴더 안의 항목 목록 ('.', '..' 제외)"""
-    return [f for f in conn.listPath(SHARE_NAME, remote_path) if f.filename not in (".", "..")]
+    return [f for f in conn.listPath(conn.share_name, remote_path) if f.filename not in (".", "..")]
+
+
+def resolve_remote_dir(conn, address: str, remote_path: str) -> str:
+    """경로를 한 단계씩 따라가며 폴더 이름을 대소문자 구분 없이 찾아,
+    장비에 실제로 있는 이름(대소문자 그대로)으로 된 경로를 돌려준다.
+    못 찾으면 그 위치에 있는 폴더 목록을 담아 RemotePathNotFound를 낸다."""
+    resolved = ""
+    for part in [p for p in remote_path.replace("/", "\\").split("\\") if p]:
+        try:
+            entries = list_remote(conn, resolved)
+        except OperationFailure as e:
+            raise RemotePathNotFound("{0} 폴더 목록을 읽을 수 없습니다: {1}".format(
+                unc_display(address, resolved, conn.share_name), str(e).splitlines()[0]))
+        dirs = [f.filename for f in entries if f.isDirectory]
+        match = None
+        for name in dirs:
+            if name == part:
+                match = name
+                break
+            if match is None and name.lower() == part.lower():
+                match = name
+        if match is None:
+            raise RemotePathNotFound("원본 폴더를 찾을 수 없습니다: {0}\n{1} 안의 폴더: {2}".format(
+                unc_display(address, remote_join(resolved, part), conn.share_name),
+                unc_display(address, resolved, conn.share_name), _names_preview(dirs)))
+        resolved = remote_join(resolved, match)
+    return resolved
 
 
 def download_file(conn, remote_file: str, shared_file, dst_file: str):
     """원격 파일을 로컬로 내려받고 수정 시간을 원본과 맞춘다."""
     try:
         with open(dst_file, "wb") as fobj:
-            conn.retrieveFile(SHARE_NAME, remote_file, fobj, timeout=FILE_TIMEOUT)
+            conn.retrieveFile(conn.share_name, remote_file, fobj, timeout=FILE_TIMEOUT)
     except Exception:
         # 중간에 실패하면 불완전한 파일이 남지 않도록 삭제
         try:
@@ -331,8 +390,8 @@ def download_file(conn, remote_file: str, shared_file, dst_file: str):
 
 
 def copy_all(conn, address: str, source: str, dest: str, log):
-    if not remote_isdir(conn, source):
-        raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(unc_display(address, source)))
+    source = resolve_remote_dir(conn, address, source)
+    share = conn.share_name
     count = 0
     # 하위 폴더까지 순회 (스택 사용)
     stack = [(source, dest)]
@@ -347,14 +406,14 @@ def copy_all(conn, address: str, source: str, dest: str, log):
                 continue
             download_file(conn, remote_file, f, local_file)
             count += 1
-            log("  복사: {0} -> {1}".format(unc_display(address, remote_file), local_file))
-    log("[완료] {0} : {1}개 파일 복사".format(unc_display(address, source), count))
+            log("  복사: {0} -> {1}".format(unc_display(address, remote_file, share), local_file))
+    log("[완료] {0} : {1}개 파일 복사".format(unc_display(address, source, share), count))
 
 
 def copy_date_range(conn, address: str, source: str, dest: str, date_regex: str, date_format: str,
                     start_date: datetime, end_date: datetime, log):
-    if not remote_isdir(conn, source):
-        raise RuntimeError("원본 폴더를 찾을 수 없습니다: {0}".format(unc_display(address, source)))
+    source = resolve_remote_dir(conn, address, source)
+    share = conn.share_name
     os.makedirs(dest, exist_ok=True)
     pattern = re.compile(date_regex, re.IGNORECASE)
     # 종료일은 사용자가 날짜만 입력하므로, 그 날의 마지막 순간까지 포함시킴
@@ -378,11 +437,11 @@ def copy_date_range(conn, address: str, source: str, dest: str, date_regex: str,
             dst_file = os.path.join(dest, f.filename)
             download_file(conn, remote_file, f, dst_file)
             count += 1
-            log("  복사: {0} -> {1}".format(unc_display(address, remote_file), dst_file))
+            log("  복사: {0} -> {1}".format(unc_display(address, remote_file, share), dst_file))
         else:
             skipped += 1
     log("[완료] {0} : {1}개 파일 복사 (범위 밖/미매칭 {2}개 제외)".format(
-        unc_display(address, source), count, skipped))
+        unc_display(address, source, share), count, skipped))
 
 
 # =========================================================
@@ -659,14 +718,19 @@ class App(tk.Tk):
         conn = None
         try:
             conn = open_smb(address, username, password, self.log)
-            if remote_isdir(conn, device_folder):
-                self.log("[확인] {0} 접근 가능".format(unc_display(address, device_folder)))
-                self.after(0, lambda: messagebox.showinfo("연결 확인", "연결 성공: 해당 경로에 접근할 수 있습니다."))
-            else:
-                self.log("[확인] {0} 경로를 찾을 수 없습니다".format(unc_display(address, device_folder)))
+            try:
+                actual = resolve_remote_dir(conn, address, device_folder)
+            except RemotePathNotFound as e:
+                detail = str(e)
+                self.log("[확인] 경로를 찾을 수 없습니다\n{0}".format(detail))
                 self.after(0, lambda: messagebox.showwarning(
-                    "연결 확인", "공유 폴더 접속은 됐지만, 해당 장비 폴더를 찾을 수 없습니다.\n장비 종류나 주소를 다시 확인하세요."
+                    "연결 확인",
+                    "공유 폴더 접속은 됐지만, 해당 장비 폴더를 찾을 수 없습니다.\n"
+                    "장비 종류나 주소를 다시 확인하세요.\n\n" + detail
                 ))
+            else:
+                self.log("[확인] {0} 접근 가능".format(unc_display(address, actual, conn.share_name)))
+                self.after(0, lambda: messagebox.showinfo("연결 확인", "연결 성공: 해당 경로에 접근할 수 있습니다."))
         except Exception as e:
             msg = str(e)
             self.log("[확인 실패] {0}".format(msg))
