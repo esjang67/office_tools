@@ -137,6 +137,10 @@ NT_STATUS_TEXT = {
     0xC000006F: "로그온 허용 시간 아님",
     0xC0000070: "허용되지 않은 PC",
     0xC0000022: "접근 거부",
+    0xC00000BD: "서버 이름 불일치 (STATUS_DUPLICATE_NAME)",
+    0xC00000CC: "공유 이름이 없음 (STATUS_BAD_NETWORK_NAME)",
+    0xC0000034: "경로 없음",
+    0xC000003A: "경로 없음",
 }
 
 # 더 시도해 봐야 소용없는 상태 (계정 자체 문제)
@@ -276,6 +280,10 @@ def open_smb(address: str, username: str, password: str, log):
             desc = "{0}번 포트 {1} 도메인='{2}'".format(
                 port, "NTLMv2" if use_ntlm_v2 else "NTLMv1", conn.used_domain)
             if ok:
+                # 공유 폴더 연결 시 경로가 \\<remote_name>\<공유> 로 만들어지는데,
+                # XP는 자기 IP/컴퓨터 이름이 아닌 이름(*SMBSERVER)이 오면
+                # STATUS_DUPLICATE_NAME 으로 거부한다. Windows(net use)처럼 주소를 쓴다.
+                conn.remote_name = address
                 log("[연결] \\\\{0} 접속 성공 ({1}, {2})".format(
                     address, desc, "SMB2" if conn.isUsingSMB2 else "SMB1"))
                 return conn
@@ -298,6 +306,28 @@ def close_smb(conn, address: str, log):
     except Exception:
         pass
     log("[연결 해제] \\\\{0}".format(address))
+
+
+def smb_failure_status(e):
+    """OperationFailure에 담긴 마지막 SMB 응답의 NT 상태 코드"""
+    for m in reversed(getattr(e, "smb_messages", []) or []):
+        status = getattr(m, "status", None)
+        if status is None:
+            continue
+        status = getattr(status, "internal_value", status)
+        if status:
+            return status
+    return None
+
+
+def check_share(conn, address: str, log):
+    """공유 폴더(SHARE_NAME)에 실제로 연결되는지 확인. 실패하면 이유와 함께 예외"""
+    try:
+        conn.listPath(SHARE_NAME, "\\")
+    except OperationFailure as e:
+        raise RuntimeError("\\\\{0}\\{1} 공유 폴더 연결 실패: {2}".format(
+            address, SHARE_NAME, nt_status_text(smb_failure_status(e))))
+    log("[연결] \\\\{0}\\{1} 공유 폴더 연결 성공".format(address, SHARE_NAME))
 
 
 def remote_isdir(conn, remote_path: str) -> bool:
@@ -659,6 +689,7 @@ class App(tk.Tk):
         conn = None
         try:
             conn = open_smb(address, username, password, self.log)
+            check_share(conn, address, self.log)
             if remote_isdir(conn, device_folder):
                 self.log("[확인] {0} 접근 가능".format(unc_display(address, device_folder)))
                 self.after(0, lambda: messagebox.showinfo("연결 확인", "연결 성공: 해당 경로에 접근할 수 있습니다."))
@@ -738,6 +769,7 @@ class App(tk.Tk):
         conn = None
         try:
             conn = open_smb(address, username, password, self.log)
+            check_share(conn, address, self.log)
 
             for job in jobs:
                 self.log("\n=== {0} 시작 ===".format(job["name"]))
